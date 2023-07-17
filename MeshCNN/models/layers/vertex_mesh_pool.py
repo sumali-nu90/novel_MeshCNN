@@ -38,9 +38,9 @@ class VertexMeshPool(nn.Module):
         return out_features
 
     def __pool_main(self, mesh_index):
-        mesh = self.meshes[mesh_index]
+        mesh = self.__meshes[mesh_index]
         vertices_count = mesh.num_vertices  # Replace with the correct attribute for vertices count
-        queue = self.__build_queue(self.__fe[mesh_index, :, :vertices_count], vertices_count)
+        queue = self.__build_queue(self.__fe[mesh_index, :, :mesh.vertices_count], mesh.vertices_count)
         mask = np.ones(mesh.vertices_count, dtype=np.bool)
         vertex_groups = VertexMeshUnion(mesh.vertices_count, self.__fe.device)
         while mesh.vertices_count > self.__out_target:
