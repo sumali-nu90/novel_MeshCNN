@@ -3,16 +3,10 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
-from models.layers.mesh_conv import MeshConv
+from models.layers.vertex_mesh_conv import VertexMeshConv
 import torch.nn.functional as F
-from models.layers.mesh_pool import MeshPool
-from models.layers.mesh_unpool import MeshUnpool
-
-
-###############################################################################
-# Helper Functions
-###############################################################################
-
+from models.layers.vertex_mesh_pool import VertexMeshPool
+from models.layers.vertex_mesh_unpool import VertexMeshUnpool
 
 def get_norm_layer(norm_type='instance', num_groups=1):
     if norm_type == 'batch':
@@ -106,6 +100,9 @@ def define_classifier(input_nc, ncf, ninput_edges, nclasses, opt, gpu_ids, arch,
         pool_res = [ninput_edges] + opt.pool_res
         net = MeshEncoderDecoder(pool_res, down_convs, up_convs, blocks=opt.resblocks,
                                  transfer_data=True)
+    elif arch == 'my_new_model':
+        net = MyMeshConvNet(norm_layer, input_nc, ncf, nclasses, ninput_edges, opt.pool_res, opt.fc_n,
+                            opt.resblocks, use_faces=True)
     else:
         raise NotImplementedError('Encoder model name [%s] is not recognized' % arch)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -134,11 +131,10 @@ class MeshConvNet(nn.Module):
         for i, ki in enumerate(self.k[:-1]):
             setattr(self, 'conv{}'.format(i), MResConv(ki, self.k[i + 1], nresblocks))
             setattr(self, 'norm{}'.format(i), norm_layer(**norm_args[i]))
-            setattr(self, 'pool{}'.format(i), MeshPool(self.res[i + 1]))
+            setattr(self, 'pool{}'.format(i), VertexMeshPool(self.res[i + 1]))
 
 
         self.gp = torch.nn.AvgPool1d(self.res[-1])
-        # self.gp = torch.nn.MaxPool1d(self.res[-1])
         self.fc1 = nn.Linear(self.k[-1], fc_n)
         self.fc2 = nn.Linear(fc_n, nclasses)
 
@@ -162,11 +158,11 @@ class MResConv(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.skips = skips
-        self.conv0 = MeshConv(self.in_channels, self.out_channels, bias=False)
+        self.conv0 = VertexMeshConv(self.in_channels, self.out_channels, bias=False)
         for i in range(self.skips):
             setattr(self, 'bn{}'.format(i + 1), nn.BatchNorm2d(self.out_channels))
             setattr(self, 'conv{}'.format(i + 1),
-                    MeshConv(self.out_channels, self.out_channels, bias=False))
+                    VertexMeshConv(self.out_channels, self.out_channels, bias=False))
 
     def forward(self, x, mesh):
         x = self.conv0(x, mesh)
@@ -178,6 +174,7 @@ class MResConv(nn.Module):
         x = F.relu(x)
         return x
 
+# Rest of the code...
 
 class MeshEncoderDecoder(nn.Module):
     """Network for fully-convolutional tasks (segmentation)
@@ -197,98 +194,6 @@ class MeshEncoderDecoder(nn.Module):
 
     def __call__(self, x, meshes):
         return self.forward(x, meshes)
-
-class DownConv(nn.Module):
-    def __init__(self, in_channels, out_channels, blocks=0, pool=0):
-        super(DownConv, self).__init__()
-        self.bn = []
-        self.pool = None
-        self.conv1 = MeshConv(in_channels, out_channels)
-        self.conv2 = []
-        for _ in range(blocks):
-            self.conv2.append(MeshConv(out_channels, out_channels))
-            self.conv2 = nn.ModuleList(self.conv2)
-        for _ in range(blocks + 1):
-            self.bn.append(nn.InstanceNorm2d(out_channels))
-            self.bn = nn.ModuleList(self.bn)
-        if pool:
-            self.pool = MeshPool(pool)
-
-    def __call__(self, x):
-        return self.forward(x)
-
-    def forward(self, x):
-        fe, meshes = x
-        x1 = self.conv1(fe, meshes)
-        if self.bn:
-            x1 = self.bn[0](x1)
-        x1 = F.relu(x1)
-        x2 = x1
-        for idx, conv in enumerate(self.conv2):
-            x2 = conv(x1, meshes)
-            if self.bn:
-                x2 = self.bn[idx + 1](x2)
-            x2 = x2 + x1
-            x2 = F.relu(x2)
-            x1 = x2
-        x2 = x2.squeeze(3)
-        before_pool = None
-        if self.pool:
-            before_pool = x2
-            x2 = self.pool(x2, meshes)
-        return x2, before_pool
-
-
-class UpConv(nn.Module):
-    def __init__(self, in_channels, out_channels, blocks=0, unroll=0, residual=True,
-                 batch_norm=True, transfer_data=True):
-        super(UpConv, self).__init__()
-        self.residual = residual
-        self.bn = []
-        self.unroll = None
-        self.transfer_data = transfer_data
-        self.up_conv = MeshConv(in_channels, out_channels)
-        if transfer_data:
-            self.conv1 = MeshConv(2 * out_channels, out_channels)
-        else:
-            self.conv1 = MeshConv(out_channels, out_channels)
-        self.conv2 = []
-        for _ in range(blocks):
-            self.conv2.append(MeshConv(out_channels, out_channels))
-            self.conv2 = nn.ModuleList(self.conv2)
-        if batch_norm:
-            for _ in range(blocks + 1):
-                self.bn.append(nn.InstanceNorm2d(out_channels))
-            self.bn = nn.ModuleList(self.bn)
-        if unroll:
-            self.unroll = MeshUnpool(unroll)
-
-    def __call__(self, x, from_down=None):
-        return self.forward(x, from_down)
-
-    def forward(self, x, from_down):
-        from_up, meshes = x
-        x1 = self.up_conv(from_up, meshes).squeeze(3)
-        if self.unroll:
-            x1 = self.unroll(x1, meshes)
-        if self.transfer_data:
-            x1 = torch.cat((x1, from_down), 1)
-        x1 = self.conv1(x1, meshes)
-        if self.bn:
-            x1 = self.bn[0](x1)
-        x1 = F.relu(x1)
-        x2 = x1
-        for idx, conv in enumerate(self.conv2):
-            x2 = conv(x1, meshes)
-            if self.bn:
-                x2 = self.bn[idx + 1](x2)
-            if self.residual:
-                x2 = x2 + x1
-            x2 = F.relu(x2)
-            x1 = x2
-        x2 = x2.squeeze(3)
-        return x2
-
 
 class MeshEncoder(nn.Module):
     def __init__(self, pools, convs, fcs=None, blocks=0, global_pool=None):
@@ -348,6 +253,95 @@ class MeshEncoder(nn.Module):
     def __call__(self, x):
         return self.forward(x)
 
+class DownConv(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=0, pool=0):
+        super(DownConv, self).__init__()
+        self.bn = []
+        self.pool = None
+        self.conv1 = VertexMeshConv(in_channels, out_channels)
+        self.conv2 = []
+        for _ in range(blocks):
+            self.conv2.append(VertexMeshConv(out_channels, out_channels))
+            self.conv2 = nn.ModuleList(self.conv2)
+        for _ in range(blocks + 1):
+            self.bn.append(nn.InstanceNorm2d(out_channels))
+            self.bn = nn.ModuleList(self.bn)
+        if pool:
+            self.pool = VertexMeshPool(pool)
+
+    def __call__(self, x):
+        return self.forward(x)
+
+    def forward(self, x):
+        fe, meshes = x
+        x1 = self.conv1(fe, meshes)
+        if self.bn:
+            x1 = self.bn[0](x1)
+        x1 = F.relu(x1)
+        x2 = x1
+        for idx, conv in enumerate(self.conv2):
+            x2 = conv(x1, meshes)
+            if self.bn:
+                x2 = self.bn[idx + 1](x2)
+            x2 = x2 + x1
+            x2 = F.relu(x2)
+            x1 = x2
+        x2 = x2.squeeze(3)
+        before_pool = None
+        if self.pool:
+            before_pool = x2
+            x2 = self.pool(x2, meshes)
+        return x2, before_pool
+
+class UpConv(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=0, unroll=0, residual=True,
+                 batch_norm=True, transfer_data=True):
+        super(UpConv, self).__init__()
+        self.residual = residual
+        self.bn = []
+        self.unroll = None
+        self.transfer_data = transfer_data
+        self.up_conv = VertexMeshConv(in_channels, out_channels)
+        if transfer_data:
+            self.conv1 = VertexMeshConv(2 * out_channels, out_channels)
+        else:
+            self.conv1 = VertexMeshConv(out_channels, out_channels)
+        self.conv2 = []
+        for _ in range(blocks):
+            self.conv2.append(VertexMeshConv(out_channels, out_channels))
+            self.conv2 = nn.ModuleList(self.conv2)
+        if batch_norm:
+            for _ in range(blocks + 1):
+                self.bn.append(nn.InstanceNorm2d(out_channels))
+            self.bn = nn.ModuleList(self.bn)
+        if unroll:
+            self.unroll = VertexMeshUnpool(unroll)
+
+    def __call__(self, x, from_down=None):
+        return self.forward(x, from_down)
+
+    def forward(self, x, from_down):
+        from_up, meshes = x
+        x1 = self.up_conv(from_up, meshes).squeeze(3)
+        if self.unroll:
+            x1 = self.unroll(x1, meshes)
+        if self.transfer_data:
+            x1 = torch.cat((x1, from_down), 1)
+        x1 = self.conv1(x1, meshes)
+        if self.bn:
+            x1 = self.bn[0](x1)
+        x1 = F.relu(x1)
+        x2 = x1
+        for idx, conv in enumerate(self.conv2):
+            x2 = conv(x1, meshes)
+            if self.bn:
+                x2 = self.bn[idx + 1](x2)
+            if self.residual:
+                x2 = x2 + x1
+            x2 = F.relu(x2)
+            x1 = x2
+        x2 = x2.squeeze(3)
+        return x2
 
 class MeshDecoder(nn.Module):
     def __init__(self, unrolls, convs, blocks=0, batch_norm=True, transfer_data=True):
@@ -377,12 +371,3 @@ class MeshDecoder(nn.Module):
 
     def __call__(self, x, encoder_outs=None):
         return self.forward(x, encoder_outs)
-
-def reset_params(model): # todo replace with my init
-    for i, m in enumerate(model.modules()):
-        weight_init(m)
-
-def weight_init(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.xavier_normal_(m.weight)
-        nn.init.constant_(m.bias, 0)
